@@ -66,11 +66,12 @@ type Response struct {
 
 // Client data structure for HTTP cache middleware.
 type Client struct {
-	adapter         Adapter
-	ttl             time.Duration
-	refreshKey      string
-	methods         []string
-	restrictedPaths []string
+	adapter          Adapter
+	ttl              time.Duration
+	refreshKey       string
+	methods          []string
+	restrictedPaths  []string
+	allowedPathsOnly []string
 }
 
 type bodyDumpResponseWriter struct {
@@ -202,6 +203,87 @@ func (client *Client) Middleware() echo.MiddlewareFunc {
 	}
 }
 
+// Middleware is the HTTP cache middleware handler.
+func (client *Client) MiddlewareWithWhiteListOnly() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+
+			if client.isAllowedPathsOnlyToCache(c.Request().URL.String()) && client.cacheableMethod(c.Request().Method) {
+				sortURLParams(c.Request().URL)
+				key := generateKey(c.Request().URL.String())
+				if c.Request().Method == http.MethodPost && c.Request().Body != nil {
+					body, err := ioutil.ReadAll(c.Request().Body)
+					defer c.Request().Body.Close()
+					if err != nil {
+						next(c)
+						return nil
+					}
+					reader := ioutil.NopCloser(bytes.NewBuffer(body))
+					key = generateKeyWithBody(c.Request().URL.String(), body)
+					c.Request().Body = reader
+				}
+
+				params := c.Request().URL.Query()
+				if _, ok := params[client.refreshKey]; ok {
+					delete(params, client.refreshKey)
+
+					c.Request().URL.RawQuery = params.Encode()
+					key = generateKey(c.Request().URL.String())
+
+					client.adapter.Release(key)
+				} else {
+					b, ok := client.adapter.Get(key)
+					response := BytesToResponse(b)
+					if ok {
+						if response.Expiration.After(time.Now()) {
+							response.LastAccess = time.Now()
+							response.Frequency++
+							client.adapter.Set(key, response.Bytes(), response.Expiration)
+
+							for k, v := range response.Header {
+								c.Response().Header().Set(k, strings.Join(v, ","))
+							}
+							c.Response().WriteHeader(http.StatusOK)
+							c.Response().Write(response.Value)
+							return nil
+						}
+
+						client.adapter.Release(key)
+					}
+				}
+
+				resBody := new(bytes.Buffer)
+				mw := io.MultiWriter(c.Response().Writer, resBody)
+				writer := &bodyDumpResponseWriter{Writer: mw, ResponseWriter: c.Response().Writer}
+				c.Response().Writer = writer
+				if err := next(c); err != nil {
+					c.Error(err)
+				}
+
+				statusCode := writer.statusCode
+				value := resBody.Bytes()
+				if statusCode < 400 {
+					now := time.Now()
+
+					response := Response{
+						Value:      value,
+						Header:     writer.Header(),
+						Expiration: now.Add(client.ttl),
+						LastAccess: now,
+						Frequency:  1,
+					}
+					client.adapter.Set(key, response.Bytes(), response.Expiration)
+				}
+				return nil
+			}
+			if err := next(c); err != nil {
+				c.Error(err)
+			}
+			return nil
+		}
+	}
+}
+
 func (c *Client) cacheableMethod(method string) bool {
 	for _, m := range c.methods {
 		if method == m {
@@ -218,6 +300,15 @@ func (c *Client) isAllowedPathToCache(URL string) bool {
 		}
 	}
 	return true
+}
+
+func (c *Client) isAllowedPathsOnlyToCache(URL string) bool {
+	for _, p := range c.allowedPathsOnly {
+		if strings.Contains(URL, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // BytesToResponse converts bytes array into Response data structure.
@@ -342,6 +433,15 @@ func ClientWithMethods(methods []string) ClientOption {
 func ClientWithRestrictedPaths(paths []string) ClientOption {
 	return func(c *Client) error {
 		c.restrictedPaths = paths
+		return nil
+	}
+}
+
+// ClientWithRestrictedPaths sets the restricted HTTP paths for caching.
+// Optional setting.
+func ClientWithAllowedPathsOnly(paths []string) ClientOption {
+	return func(c *Client) error {
+		c.allowedPathsOnly = paths
 		return nil
 	}
 }
